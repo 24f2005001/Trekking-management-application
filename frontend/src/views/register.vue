@@ -67,7 +67,7 @@
           </div>
 
           <div v-if="error" class="alert alert-danger py-2 my-2 text-center small rounded-3">
-            {{ error }}
+            {{ error }} 
           </div>
 
           <button 

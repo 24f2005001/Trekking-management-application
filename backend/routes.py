@@ -2,10 +2,19 @@ from flask import request, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import create_access_token,jwt_required,get_jwt,get_jwt_identity
 from datetime import date,datetime
+from sqlalchemy import func
+import tasks
 
 
 from models import User,Trek,Booking
 from db import db
+from cache import cache
+
+
+OPEN_STATUS = "open"
+BOOKED_STATUS = "Booked"
+COMPLETED_STATUS = "Completed"
+TREK_CACHE_KEY = "view//api/treks/search"
 
 def admin_only():
     claims = get_jwt()
@@ -14,6 +23,27 @@ def admin_only():
 def staff_only():
     claims = get_jwt()
     return claims.get("role") in ["admin", "staff"]
+
+def clear_trek_cache():
+    try:
+        cache.clear()
+    except Exception:
+        pass
+
+def task_response(task_id):
+    result = tasks.celery.AsyncResult(task_id)
+    payload = {
+        "task_id": task_id,
+        "state": result.state,
+        "ready": result.ready(),
+    }
+
+    if result.successful():
+        payload["result"] = result.result
+    elif result.failed():
+        payload["error"] = str(result.result)
+
+    return payload
 
 
 def register_routes(app):
@@ -84,7 +114,7 @@ def register_routes(app):
             return jsonify({"message": "Administration access required."}), 403
         
         total_treks = Trek.query.count()
-        total_users = User.query.filter_by(role="user").count()
+        total_users = User.query.filter(User.role.in_(["trekker", "user"])).count()
         total_staff = User.query.filter_by(role="staff").count()
         total_bookings = Booking.query.count()
         
@@ -94,6 +124,94 @@ def register_routes(app):
             "total_staff": total_staff,
             "total_bookings": total_bookings
         }), 200
+
+    @app.route('/api/admin/reports', methods=['GET'])
+    @jwt_required()
+    def admin_reports():
+        if not admin_only():
+            return jsonify({"message": "Administration access required."}), 403
+
+        popular_rows = (
+            db.session.query(
+                Trek.id,
+                Trek.title,
+                Trek.location,
+                func.count(Booking.id).label("booking_count")
+            )
+            .outerjoin(Booking, Booking.trek_id == Trek.id)
+            .group_by(Trek.id)
+            .order_by(func.count(Booking.id).desc())
+            .limit(5)
+            .all()
+        )
+
+        status_rows = (
+            db.session.query(Booking.status, func.count(Booking.id))
+            .group_by(Booking.status)
+            .all()
+        )
+
+        trek_status_rows = (
+            db.session.query(Trek.status, func.count(Trek.id))
+            .group_by(Trek.status)
+            .all()
+        )
+
+        completed_treks = Trek.query.filter(Trek.status.ilike("completed")).count()
+        participating_users = (
+            db.session.query(Booking.user_id)
+            .filter(Booking.status.in_([BOOKED_STATUS, COMPLETED_STATUS]))
+            .distinct()
+            .count()
+        )
+
+        return jsonify({
+            "completed_treks": completed_treks,
+            "participating_users": participating_users,
+            "popular_treks": [{
+                "id": row.id,
+                "title": row.title,
+                "location": row.location,
+                "booking_count": row.booking_count
+            } for row in popular_rows],
+            "booking_status_counts": [{
+                "status": status or "Unknown",
+                "count": count
+            } for status, count in status_rows],
+            "trek_status_counts": [{
+                "status": status or "Unknown",
+                "count": count
+            } for status, count in trek_status_rows]
+        }), 200
+
+    @app.route('/api/admin/jobs/daily-reminders', methods=['POST'])
+    @jwt_required()
+    def admin_trigger_daily_reminders():
+        if not admin_only():
+            return jsonify({"message": "Administration access required."}), 403
+
+        task = tasks.celery.send_task("tasks.send_daily_reminders") 
+        return jsonify({
+            "message": "Daily reminder job queued.",
+            "task_id": task.id
+        }), 202
+
+    @app.route('/api/admin/jobs/monthly-report', methods=['POST'])
+    @jwt_required()
+    def admin_trigger_monthly_report():
+        if not admin_only():
+            return jsonify({"message": "Administration access required."}), 403
+
+        task = tasks.celery.send_task("tasks.send_monthly_report") 
+        return jsonify({
+            "message": "Monthly report job queued.",
+            "task_id": task.id
+        }), 202
+
+    @app.route('/api/jobs/<task_id>', methods=['GET'])
+    @jwt_required()
+    def get_job_status(task_id):
+        return jsonify(task_response(task_id)), 200
     
 
     @app.route('/api/admin/staff', methods=['POST'])
@@ -112,6 +230,9 @@ def register_routes(app):
             
         if User.query.filter_by(email=email).first():
             return jsonify({"message": "Email already registered."}), 400
+
+        if User.query.filter_by(username=username).first():
+            return jsonify({"message": "Username already registered."}), 400
             
         hashed_pw = generate_password_hash(password)
         staff = User(
@@ -185,7 +306,8 @@ def register_routes(app):
                 "trek_id": b.trek_id,
                 "trek_name": trek.title if trek else "Deleted Trek",
                 "booking_date": b.booking_date.strftime('%Y-%m-%d') if b.booking_date else None,
-                "status": b.status
+                "status": b.status,
+                "payment_status": b.payment_status
             })
         return jsonify(output), 200
     
@@ -202,6 +324,13 @@ def register_routes(app):
             end_dt = datetime.strptime(data.get('end_date'), '%Y-%m-%d').date()
 
             total_slots = int(data.get('total_slots', 0))
+            staff_id = data.get('staff_id') or None
+
+            if staff_id:
+                staff_user = User.query.filter_by(id=int(staff_id), role="staff", is_active=True).first()
+                if not staff_user:
+                    return jsonify({"message": "Assigned staff must be an active staff account."}), 400
+
             trek = Trek(
                 title=data.get('title'),
                 location=data.get('location'),
@@ -209,14 +338,15 @@ def register_routes(app):
                 duration_days=int(data.get('duration_days', 1)),
                 total_slots=total_slots,
                 available_slots=total_slots, 
-                status=data.get('status', 'pending'), 
+                status=data.get('status', 'pending').lower(), 
                 start_date=start_dt,
                 end_date=end_dt,
                 price=float(data.get('price', 0.0)),
-                staff_id=data.get('staff_id') 
+                staff_id=staff_id
             )
             db.session.add(trek)
             db.session.commit()
+            clear_trek_cache()
             return jsonify({"message": "Trek created successfully!", "trek_id": trek.id}), 201
             
         except (ValueError, TypeError) as e:
@@ -263,8 +393,14 @@ def register_routes(app):
             if 'difficulty' in data: trek.difficulty = data['difficulty']
             if 'duration_days' in data: trek.duration_days = int(data['duration_days'])
             if 'price' in data: trek.price = float(data['price'])
-            if 'status' in data: trek.status = data['status']
-            if 'staff_id' in data: trek.staff_id = data['staff_id']
+            if 'status' in data: trek.status = data['status'].lower()
+            if 'staff_id' in data:
+                staff_id = data['staff_id'] or None
+                if staff_id:
+                    staff_user = User.query.filter_by(id=int(staff_id), role="staff", is_active=True).first()
+                    if not staff_user:
+                        return jsonify({"message": "Assigned staff must be an active staff account."}), 400
+                trek.staff_id = staff_id
             
             if 'total_slots' in data:
                 old_total = trek.total_slots
@@ -279,7 +415,11 @@ def register_routes(app):
             if 'end_date' in data:
                 trek.end_date = datetime.strptime(data['end_date'], '%Y-%m-%d').date()
 
+            if trek.status.lower() == "completed":
+                Booking.query.filter_by(trek_id=trek.id, status=BOOKED_STATUS).update({"status": COMPLETED_STATUS})
+
             db.session.commit()
+            clear_trek_cache()
             return jsonify({"message": "Trek updated successfully!"}), 200
             
         except (ValueError, TypeError) as e:
@@ -292,8 +432,14 @@ def register_routes(app):
         if not admin_only():
             return jsonify({"message": "Administration access required."}), 403
         trek = Trek.query.get_or_404(trek_id)
+        if len(trek.bookings) > 0:
+            return jsonify({
+                "message": "Cannot delete this trek because it has active or past bookings. Please update its status to 'Closed' instead to maintain historical data."
+            }), 400
+        
         db.session.delete(trek)
         db.session.commit()
+        clear_trek_cache()
         return jsonify({"message": "Trek deleted completely."}), 200
     
     #trek staff endpoints
@@ -315,7 +461,7 @@ def register_routes(app):
         output = []
         for t in treks:
             
-            registered_count = Booking.query.filter_by(trek_id=t.id, status="Booked").count()
+            registered_count = Booking.query.filter_by(trek_id=t.id, status=BOOKED_STATUS).count()
             output.append({
                 "id": t.id,
                 "title": t.title,
@@ -346,11 +492,18 @@ def register_routes(app):
         data = request.get_json() or {}
         
         if 'status' in data:
-            trek.status = data['status']  
+            trek.status = data['status'].lower()
         if 'available_slots' in data:
-            trek.available_slots = int(data['available_slots'])
+            available_slots = int(data['available_slots'])
+            if available_slots < 0 or available_slots > trek.total_slots:
+                return jsonify({"message": "Available slots must be between 0 and total slots."}), 400
+            trek.available_slots = available_slots
+
+        if trek.status.lower() == "completed":
+            Booking.query.filter_by(trek_id=trek.id, status=BOOKED_STATUS).update({"status": COMPLETED_STATUS})
             
         db.session.commit()
+        clear_trek_cache()
         return jsonify({"message": "Trek progress updated successfully."}), 200
 
     @app.route('/api/staff/treks/<int:trek_id>/participants', methods=['GET'])
@@ -375,7 +528,8 @@ def register_routes(app):
                     "user_id": u.id,
                     "username": u.username,
                     "email": u.email,
-                    "booking_status": b.status
+                    "booking_status": b.status,
+                    "booking_date": b.booking_date.strftime('%Y-%m-%d') if b.booking_date else None
                 })
         return jsonify(participants), 200
     
@@ -396,8 +550,18 @@ def register_routes(app):
             
         elif request.method == 'PUT':
             data = request.get_json() or {}
+            
             if 'username' in data:
-                user.username = data['username']
+                new_username = data['username'].strip()
+                
+                # Check if username is taken by ANYONE ELSE
+                if new_username.lower() != user.username.lower():
+                    existing_user = User.query.filter(func.lower(User.username) == new_username.lower()).first()
+                    if existing_user:
+                        return jsonify({"message": "Username is already taken."}), 400
+                
+                user.username = new_username
+                
             if 'password' in data and data['password'].strip():
                 user.password_hash = generate_password_hash(data['password'])
                 
@@ -405,9 +569,10 @@ def register_routes(app):
             return jsonify({"message": "Profile updated successfully."}), 200
 
     @app.route('/api/treks/search', methods=['GET'])
+    @cache.cached(timeout=60, query_string=True)
     def user_browse_treks():
         
-        query = Trek.query.filter_by(status="Open")
+        query = Trek.query.filter(Trek.status.ilike("open"))
         
         
         search = request.args.get('search')
@@ -418,11 +583,15 @@ def register_routes(app):
         if search:
             query = query.filter((Trek.title.like(f"%{search}%")) | (Trek.location.like(f"%{search}%")))
         if difficulty:
-            query = query.filter_by(difficulty=difficulty)
+            query = query.filter(Trek.difficulty.ilike(difficulty))
         if location:
             query = query.filter(Trek.location.like(f"%{location}%"))
         if max_duration:
-            query = query.filter(Trek.duration_days <= int(max_duration))
+            try: 
+                duration_val = int(max_duration)
+                query = query.filter(Trek.duration_days <= duration_val) 
+            except ValueError:
+                return jsonify({"message": "Duration must be a valid integer."}), 400
             
         treks = query.all()
         return jsonify([{
@@ -450,11 +619,11 @@ def register_routes(app):
         trek = Trek.query.get_or_404(trek_id)
         
         
-        if trek.status.lower() != "open":
+        if trek.status.lower() != OPEN_STATUS:
             return jsonify({"message": "This trek is closed for bookings."}), 400
             
         
-        existing_booking = Booking.query.filter_by(user_id=user_id, trek_id=trek_id, status="Booked").first()
+        existing_booking = Booking.query.filter_by(user_id=user_id, trek_id=trek_id, status=BOOKED_STATUS).first()
         if existing_booking:
             return jsonify({"message": "You already booked this trek."}), 400
             
@@ -469,11 +638,12 @@ def register_routes(app):
             user_id=user_id,
             trek_id=trek_id,
             booking_date=date.today(),
-            status="Booked"
+            status=BOOKED_STATUS
         )
         
         db.session.add(new_booking)
         db.session.commit()
+        clear_trek_cache()
         return jsonify({"message": "Trek booked successfully"}), 201
 
     @app.route('/api/user/bookings', methods=['GET'])
@@ -496,6 +666,17 @@ def register_routes(app):
             })
         return jsonify(output), 200
 
+    @app.route('/api/user/bookings/export', methods=['POST'])
+    @jwt_required()
+    def export_user_booking_history():
+        user_id = int(get_jwt_identity())
+        user = User.query.get_or_404(user_id)
+        task = tasks.celery.send_task("tasks.export_booking_csv", args=[user.id, user.email])
+        return jsonify({
+            "message": "Booking history export queued. You will receive the CSV by email.",
+            "task_id": task.id
+        }), 202
+
     @app.route('/api/bookings/<int:booking_id>/cancel', methods=['PATCH'])
     @jwt_required()
     def cancel_booking(booking_id):
@@ -509,11 +690,14 @@ def register_routes(app):
             return jsonify({"message": "Booking is already cancelled."}), 400
             
         
-        trek = Trek.query.get(booking.trek_id)
-        if trek:
-            trek.available_slots += 1
+        trek = Trek.query.with_for_update().get_or_404(booking.trek_id) #locking the db so overbooking is prevented by 2 users 
+        if trek.start_date and trek.start_date <= date.today():
+            return jsonify({"message": "Cannot cancel a trek that has already started or completed."}), 400
             
+        
+        trek.available_slots += 1
         booking.status = "Cancelled"
         db.session.commit()
+        clear_trek_cache()
         return jsonify({"message": "Reservation cancelled successfully. Slot freed."}), 200
     

@@ -108,12 +108,15 @@ export default {
 
         if (token) {
           localStorage.setItem('admin_token', token);
+          localStorage.setItem('user_role', userRole);
         }
 
         if (userRole === 'admin') {
           this.$router.push("/admindashboard");
+        } else if (userRole === 'staff') {
+          this.$router.push("/staffdashboard");
         } else {
-          this.$router.push("/dashboard");
+          this.$router.push("/userdashboard");
         }
       } catch (err) {
         this.error = err.response?.data?.message || "Invalid email or password";
